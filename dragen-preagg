@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# This script is used to launch a Nextflow workflow for the Dragen Preagg application.
+# It sets up the environment, loads necessary modules, and executes the Nextflow workflow.
+# The script also handles user interruptions, captures logs, and saves the exit status of the workflow.
+
+module load nextflow/24.04.1
+
+SELF_SCRIPT_NAME=$(basename $0)
+
+#####################################################
+## let's check where we are
+if [ -z "${DRAGEN_PREAGG_DIR}" ]; then
+    DRAGEN_PREAGG_DIR=$(dirname "$(realpath "${BASH_SOURCE[0]}")")
+fi
+
+#####################################################
+# loading env variables 
+if [[ $(pwd) =~ [Tt][Ee][Ss][Tt][Ss]? ]]; then
+    source "${DRAGEN_PREAGG_DIR}/assets/tests.env"
+    echo "-------------------------------------"
+    echo "TEST MODE (because of location [$(pwd)]): "
+    echo -e "\t"
+    ansi_mode="true"
+else
+    source "${DRAGEN_PREAGG_DIR}/assets/production.env"
+    ansi_mode="false"
+fi
+
+#####################################################
+## just some verifications
+env_vars=("DATA_ROOT_PATH" "RESULTS_ROOT_PATH" "MY_ORG_FLAGS_PATH" "PREAGG_FLAGS_PATH" "APPLICATION_NEXTFLOW_DATA_PATH")
+for var in "${env_vars[@]}"; do
+    if [ -z "${!var}" ]; then
+        echo "ERROR: environment variable '${var}' is not correctly initialized. Contact the administrator." >&2
+        exit 1
+    else
+        echo -e "\t${var}=[${!var}]"
+    fi
+done
+
+# shellcheck disable=SC2155
+export TODAY=$(date +"%Y%m%d_%H%M%S")
+export NXF_OFFLINE=true
+export NXF_DISABLE_CHECK_LATEST=true
+export NXF_ANSI_LOG=true
+export NXF_HOME="/mnt/ngsdata/MY_ORG_WORKDIR/${USER}/NXF/NXF_HOME"
+export NXF_TEMP="/mnt/ngsdata/MY_ORG_WORKDIR/${USER}/NXF/NXF_TEMP"
+export NXF_WORK="${APPLICATION_NEXTFLOW_DATA_PATH}/WORKDIR"
+export NXF_CACHE_DIR="${APPLICATION_NEXTFLOW_DATA_PATH}/CACHEDIR"
+export NXF_LOG_FILE="${RESULTS_ROOT_PATH}/${TODAY}.nextflow.log"
+export NXF_INSTANCE_RUNNING="${NXF_TEMP}/${TODAY}.${SELF_SCRIPT_NAME}.RUNNING"
+export NXF_INSTANCE_OK="${RESULTS_ROOT_PATH}/${TODAY}.nextflow.OK"
+export NXF_INSTANCE_ERROR="${RESULTS_ROOT_PATH}/${TODAY}.nextflow.ERROR"
+
+#####################################################
+## will not launch anything if an INSTANCE is RUNNING
+if ls "${NXF_TEMP}"/*".${SELF_SCRIPT_NAME}.RUNNING" 1> /dev/null 2>&1; then
+    echo "ERROR: a RUNNING INSTANCE [${NXF_TEMP}/*.RUNNING] have been detected. Can not continue."
+    exit 1
+fi
+## now we can execute
+echo "-------------------------------------"
+echo ""
+echo "Logs:"
+echo -e "\tNXF_WORK=[${NXF_WORK}]"
+echo -e "\tNXF_LOG_FILE=[${NXF_LOG_FILE}]"
+echo ""
+echo "-------------------------------------"
+echo ""
+echo "Params: "
+echo -e "\t--sample_cohort_gender_list\tlist from generate_reports stdout\tMANDATORY"
+echo -e "\t--dry\tperform a trial run with no changes made\t[false|true] (default true)"
+
+cleanup() {
+    echo "User interruption detected..."
+    echo "Cleaning nextflow process..."
+    kill -SIGTERM "$NEXTFLOW_PID"
+    echo "Waiting to close the stdout/err..."
+    wait "${TEEPID1}" "${TEEPID2}"
+    
+    echo "Creating error flag..."
+    cat "$NXF_INSTANCE_RUNNING" > "$NXF_INSTANCE_ERROR"
+    rm "$NXF_INSTANCE_RUNNING"
+
+    echo "Removing FIFOs..."
+    rm -f "$FIFO_STDOUT" "$FIFO_STDERR"
+
+    echo "Exiting..."
+    exit 1
+}
+
+# trap interuptions
+trap cleanup SIGINT SIGTERM
+
+# Generate unique identifiers for FIFOs
+FIFO_STDOUT=/tmp/nxf_stdout_$$.fifo
+FIFO_STDERR=/tmp/nxf_stderr_$$.fifo
+
+# Create FIFOs for capturing stdout and stderr
+mkfifo "$FIFO_STDOUT" "$FIFO_STDERR"
+
+# Create the running flag file
+touch "$NXF_INSTANCE_RUNNING"
+
+# launching nextflow in bg and get PID
+nextflow run "${DRAGEN_PREAGG_DIR}/main.nf" \
+    --strict \
+    -profile cluster \
+    -ansi-log ${ansi_mode} \
+    "${@}" > "$FIFO_STDOUT" 2> "$FIFO_STDERR" &
+NEXTFLOW_PID=$!
+
+# Start tee in the background and save their PIDs
+tee -a "$NXF_INSTANCE_RUNNING" < "$FIFO_STDOUT" & TEEPID1=$!
+tee -a "$NXF_INSTANCE_RUNNING" < "$FIFO_STDERR" >&2 & TEEPID2=$!
+
+# wait for the nextflow PID
+wait $NEXTFLOW_PID
+# got it and save it
+NEXTFLOW_EXIT_CODE=$?
+# Cleanup FIFOs
+rm "$FIFO_STDOUT" "$FIFO_STDERR"
+# Save the NXF exit_code
+echo "EXIT_CODE=${NEXTFLOW_EXIT_CODE}" >> "${NXF_INSTANCE_RUNNING}"
+# now have to share
+if [ $NEXTFLOW_EXIT_CODE -eq 0 ]; then
+    cat "$NXF_INSTANCE_RUNNING" > "$NXF_INSTANCE_OK"
+else
+    cat "$NXF_INSTANCE_RUNNING" > "$NXF_INSTANCE_ERROR"
+fi
+rm "$NXF_INSTANCE_RUNNING"

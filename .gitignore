@@ -1,0 +1,10 @@
+.nextflow*
+test-*
+work
+logs
+data
+test
+TEST*
+reports*
+OUTPUT
+releases/*.tar.gz
